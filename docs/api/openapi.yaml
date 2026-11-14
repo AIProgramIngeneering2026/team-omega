@@ -1,0 +1,733 @@
+openapi: 3.0.3
+info:
+  title: Omega Rooms API
+  version: 0.1.0
+  description: |
+    Поиск свободных аудиторий и управление собственными бронированиями.
+    Job — заявка на одну аудиторию и интервал; после подтверждения его id
+    служит идентификатором брони. Интервалы полуоткрытые [start_at, end_at),
+    сравнения времени выполняются в UTC. Соседние интервалы не конфликтуют.
+    Все ошибки, включая Job.error, имеют схему Error.
+    Все ответы содержат Cache-Control: no-store, чтобы кеш не возвращал
+    устаревшее состояние, результат поиска или ошибку.
+  contact:
+    name: Команда omega
+    url: https://github.com/AIProgramIngeneering2026/team-omega
+servers:
+  - url: http://localhost:8000
+    description: Локальная разработка; вне локальной среды используется HTTPS.
+security:
+  - bearerAuth: []
+tags:
+  - name: Rooms
+    description: Поиск свободных аудиторий без создания Job.
+  - name: Jobs
+    description: Создание, состояние и отмена собственной брони.
+paths:
+  /rooms/search:
+    post:
+      tags: [Rooms]
+      operationId: searchRooms
+      summary: Найти свободные аудитории
+      description: |
+        Возвращает все аудитории каталога с capacity >= participants,
+        содержащие каждый указанный код оборудования и свободные на всём
+        интервале по собственным броням и внешнему расписанию. Неизвестный
+        код оборудования просто не даёт совпадений. Пустая выдача — 200
+        с rooms: [], без ошибки. Порядок результатов — по id по возрастанию.
+        Поиск не гарантирует доступность при последующем создании Job.
+        Неверный интервал, время без смещения или начало в прошлом — 422
+        VALIDATION_ERROR с соответствующим полем; Job не создаётся.
+        Недоступное расписание не превращается в успешную пустую выдачу.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RoomSearchRequest'
+            example:
+              start_at: '2026-11-20T14:00:00+05:00'
+              end_at: '2026-11-20T15:00:00+05:00'
+              participants: 25
+              equipment: [projector]
+      responses:
+        '200':
+          description: Подходящие свободные аудитории, включая пустой список.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RoomSearchResult'
+              examples:
+                found:
+                  value:
+                    rooms:
+                      - id: A-301
+                        name: А-301
+                        capacity: 30
+                        equipment: [projector]
+                empty:
+                  value:
+                    rooms: []
+        '400':
+          $ref: '#/components/responses/BadJson'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '502':
+          description: Расписание недоступно или ответ некорректен; свободные аудитории не утверждаются.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                invalidResponse:
+                  value:
+                    code: SCHEDULE_INVALID_RESPONSE
+                    message: Получен некорректный ответ внешнего расписания
+                    details:
+                      - field: '$'
+                        issue: Невозможно проверить учебную занятость
+                unavailable:
+                  value:
+                    code: SCHEDULE_UNAVAILABLE
+                    message: Внешнее расписание недоступно
+                    details:
+                      - field: '$'
+                        issue: Не удалось установить соединение с источником расписания
+        '503':
+          $ref: '#/components/responses/StorageUnavailable'
+        '504':
+          description: Исчерпан общий срок проверки расписания 5 секунд, включая повторы.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                code: SCHEDULE_TIMEOUT
+                message: Превышен срок ожидания внешнего расписания
+                details:
+                  - field: '$'
+                    issue: Общий срок проверки расписания 5 секунд истёк
+  /jobs:
+    post:
+      tags: [Jobs]
+      operationId: createJob
+      summary: Создать заявку и проверить бронирование
+      description: |
+        Создаёт Job и синхронно проверяет возможность бронирования.
+        201 означает создание заявки; результат бронирования указан в state.
+        Время проверяется до обращения к расписанию. Проверки end_at > start_at
+        и start_at >= now используют один снимок часов на момент проверки.
+        Ошибки структуры запроса возвращают 422 без Job; неверные значения
+        строк времени сохраняются в Job с rejected.
+        При занятости — rejected / ROOM_UNAVAILABLE с полем room_id;
+        неизвестная аудитория — rejected / ROOM_NOT_FOUND с полем room_id.
+        Ошибки времени — rejected с TIMEZONE_REQUIRED, INVALID_TIME_FORMAT,
+        INVALID_INTERVAL или START_IN_PAST. Техническая ошибка расписания —
+        failed с SCHEDULE_TIMEOUT, SCHEDULE_INVALID_RESPONSE или
+        SCHEDULE_UNAVAILABLE. Общий срок проверки расписания — 5 секунд,
+        включая повторы; поздний ответ после failed не меняет результат.
+        Другая ошибка обработки — failed / INTERNAL_ERROR, если результат
+        сохранён; иначе HTTP 500 или 503. При конкурирующих бронированиях
+        подтверждается только первая атомарно зафиксированная бронь.
+        Изменения внешнего расписания после его чтения не блокируются сервисом.
+
+        Повтор с тем же ключом для того же пользователя и тем же телом
+        возвращает 200 с прежним id и текущим состоянием, даже если оно
+        created/checking: повтор не запускает новую проверку. Для получения
+        результата используется GET /jobs/{job_id}. Тот же ключ
+        с другим телом — 409 IDEMPOTENCY_KEY_REUSED без изменения Job.
+        Семантические ошибки тоже сохраняются за ключом; исправленный
+        запрос требует нового ключа. До сохранения Job ошибки структуры
+        ключ не занимают. При 5xx или потере ответа повторите создание
+        с прежним ключом и телом, чтобы выяснить результат исходного запроса.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateJobRequest'
+            examples:
+              booking:
+                value:
+                  room_id: A-301
+                  start_at: '2026-11-20T14:00:00+05:00'
+                  end_at: '2026-11-20T15:00:00+05:00'
+              rejectedMissingOffset:
+                summary: Создаётся Job с rejected / TIMEZONE_REQUIRED.
+                value:
+                  room_id: A-301
+                  start_at: '2026-11-20T14:00:00'
+                  end_at: '2026-11-20T15:00:00+05:00'
+      responses:
+        '201':
+          description: Заявка создана, исход проверки — confirmed, rejected или failed.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+            Location:
+              $ref: '#/components/headers/JobLocation'
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Job'
+                  - type: object
+                    properties:
+                      state:
+                        type: string
+                        enum: [confirmed, rejected, failed]
+              examples:
+                confirmed:
+                  value:
+                    id: e1f84f96-ab65-4128-946a-08d6e64cf028
+                    room_id: A-301
+                    start_at: '2026-11-20T14:00:00+05:00'
+                    end_at: '2026-11-20T15:00:00+05:00'
+                    state: confirmed
+                    created_at: '2026-11-20T08:00:00Z'
+                    updated_at: '2026-11-20T08:00:01Z'
+                rejected:
+                  value:
+                    id: 8b82ed67-03bd-4609-8ba8-d975006ca8c3
+                    room_id: A-301
+                    start_at: '2026-11-20T14:00:00'
+                    end_at: '2026-11-20T15:00:00+05:00'
+                    state: rejected
+                    created_at: '2026-11-20T08:00:00Z'
+                    updated_at: '2026-11-20T08:00:00Z'
+                    error:
+                      code: TIMEZONE_REQUIRED
+                      message: Укажите дату, время и смещение от UTC для начала и конца интервала
+                      details:
+                        - field: start_at
+                          issue: Не указано смещение от UTC
+                failed:
+                  value:
+                    id: a654602f-1bd5-4a98-b786-826b72cac7d2
+                    room_id: A-301
+                    start_at: '2026-11-20T14:00:00+05:00'
+                    end_at: '2026-11-20T15:00:00+05:00'
+                    state: failed
+                    created_at: '2026-11-20T08:00:00Z'
+                    updated_at: '2026-11-20T08:00:05Z'
+                    error:
+                      code: SCHEDULE_TIMEOUT
+                      message: Превышен срок ожидания внешнего расписания
+                      details:
+                        - field: '$'
+                          issue: Общий срок проверки расписания 5 секунд истёк
+        '200':
+          description: Повтор с тем же ключом и телом; исходный Job в текущем состоянии.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+            Location:
+              $ref: '#/components/headers/JobLocation'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Job'
+        '400':
+          $ref: '#/components/responses/BadJson'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          description: Idempotency-Key уже связан с другим телом этого пользователя.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                code: IDEMPOTENCY_KEY_REUSED
+                message: Ключ идемпотентности уже использован с другим запросом
+                details:
+                  - field: Idempotency-Key
+                    issue: Для новой заявки используйте новый ключ
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/StorageUnavailable'
+  /jobs/{job_id}:
+    parameters:
+      - $ref: '#/components/parameters/JobId'
+    get:
+      tags: [Jobs]
+      operationId: getJob
+      summary: Получить состояние своей заявки
+      description: |
+        Возвращает текущий Job владельца. Если confirmed и now >= end_at,
+        перед ответом переводит Job в completed. created/checking могут быть
+        видны параллельному запросу, пока исходное создание ещё выполняется.
+        GET не запускает повторную проверку расписания и не перезапускает Job.
+      responses:
+        '200':
+          description: Текущее состояние собственной заявки.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Job'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/JobNotFound'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/StorageUnavailable'
+  /jobs/{job_id}/cancel:
+    parameters:
+      - $ref: '#/components/parameters/JobId'
+    post:
+      tags: [Jobs]
+      operationId: cancelJob
+      summary: Отменить свою подтверждённую бронь до начала
+      description: |
+        Тело запроса не требуется. Владение проверяется до раскрытия состояния.
+        Перед проверкой отмены просроченный confirmed становится completed.
+        Отмена атомарно проверяет state == confirmed и now < start_at,
+        меняет состояние на cancelled и освобождает интервал.
+        Для остальных состояний — 409 INVALID_JOB_TRANSITION с полем state,
+        включая повторную отмену. При confirmed и now >= start_at —
+        409 CANCELLATION_TOO_LATE с полем start_at. При now == start_at
+        отмена запрещена. Отмена не обращается к внешнему расписанию.
+        После потери ответа GET позволяет установить результат отмены.
+      responses:
+        '200':
+          description: Бронь отменена, возвращается Job с состоянием cancelled.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Job'
+                  - type: object
+                    properties:
+                      state:
+                        type: string
+                        enum: [cancelled]
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/JobNotFound'
+        '409':
+          description: Состояние или время не допускают отмену; команда не отменяет бронь.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                invalidState:
+                  value:
+                    code: INVALID_JOB_TRANSITION
+                    message: Отмена разрешена только для подтверждённой брони
+                    details:
+                      - field: state
+                        issue: Job находится в cancelled; требуется confirmed
+                tooLate:
+                  value:
+                    code: CANCELLATION_TOO_LATE
+                    message: Нельзя отменить бронь после начала интервала
+                    details:
+                      - field: start_at
+                        issue: Требуется now < start_at
+        '422':
+          $ref: '#/components/responses/ValidationError'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/StorageUnavailable'
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: Заранее выданный токен, связанный с одним пользователем; секрет не передаётся в URL.
+  parameters:
+    JobId:
+      name: job_id
+      in: path
+      required: true
+      description: UUID Job; неверный формат — 422, неизвестный или чужой UUID — 404.
+      schema:
+        type: string
+        format: uuid
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: |
+        Уникальный ключ создания в рамках пользователя и POST /jobs.
+        Рекомендуется случайный UUID. Ключ и исходное тело хранятся весь срок
+        жизни Job, в первой версии не истекают. Сравниваются значения полей
+        JSON; порядок ключей и пробелы JSON несущественны, значения строк
+        времени сравниваются как переданы (без нормализации смещений).
+        Отсутствие или неверный формат — 422 с полем Idempotency-Key.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 128
+        pattern: '^[A-Za-z0-9._:-]+$'
+      example: 4b88554f-a049-4f38-8128-85a046006a11
+  headers:
+    NoStore:
+      description: Ответ не должен сохраняться кешами.
+      schema:
+        type: string
+        enum: [no-store]
+      example: no-store
+    JobLocation:
+      description: Относительный URL созданной или повторно полученной заявки /jobs/{id}.
+      schema:
+        type: string
+      example: /jobs/e1f84f96-ab65-4128-946a-08d6e64cf028
+  schemas:
+    RoomSearchRequest:
+      type: object
+      additionalProperties: false
+      required: [start_at, end_at, participants, equipment]
+      properties:
+        start_at:
+          type: string
+          format: date-time
+          pattern: '(Z|[+-][0-9]{2}:[0-9]{2})$'
+          description: Полная дата и время со смещением, не раньше снимка now в начале поиска.
+        end_at:
+          type: string
+          format: date-time
+          pattern: '(Z|[+-][0-9]{2}:[0-9]{2})$'
+          description: Полная дата и время со смещением, строго позже start_at после приведения к UTC.
+        participants:
+          type: integer
+          minimum: 1
+        equipment:
+          type: array
+          uniqueItems: true
+          description: Все необходимые коды оборудования; пустой список означает отсутствие требований.
+          items:
+            type: string
+            minLength: 1
+    Room:
+      type: object
+      additionalProperties: false
+      required: [id, name, capacity, equipment]
+      properties:
+        id:
+          type: string
+          minLength: 1
+        name:
+          type: string
+          minLength: 1
+        capacity:
+          type: integer
+          minimum: 1
+        equipment:
+          type: array
+          uniqueItems: true
+          items:
+            type: string
+            minLength: 1
+    RoomSearchResult:
+      type: object
+      additionalProperties: false
+      required: [rooms]
+      properties:
+        rooms:
+          type: array
+          items:
+            $ref: '#/components/schemas/Room'
+    CreateJobRequest:
+      type: object
+      additionalProperties: false
+      required: [room_id, start_at, end_at]
+      description: |
+        Неверные значения строк времени приводят к созданию rejected Job.
+        Отсутствующие или нестроковые поля, пустой room_id и лишние поля,
+        включая state и owner_id, дают 422 без создания Job. Пустые строки
+        времени сохраняются и приводят к rejected / INVALID_TIME_FORMAT.
+      properties:
+        room_id:
+          type: string
+          minLength: 1
+          description: Идентификатор из результата поиска; отсутствующая аудитория даёт rejected / ROOM_NOT_FOUND.
+        start_at:
+          type: string
+          description: |
+            Ожидается полная дата и время ISO 8601 со смещением (Z или ±HH:MM).
+            Неразбираемая строка — INVALID_TIME_FORMAT; локальная дата-время
+            без смещения — TIMEZONE_REQUIRED; начало в прошлом — START_IN_PAST.
+        end_at:
+          type: string
+          description: |
+            Те же правила формата; конец не позже начала в UTC — INVALID_INTERVAL
+            с details[].field = end_at.
+    Job:
+      type: object
+      additionalProperties: false
+      required: [id, room_id, start_at, end_at, state, created_at, updated_at]
+      description: |
+        start_at/end_at содержат исходные строки, в том числе ошибочные
+        у rejected. Для confirmed, cancelled и completed обе границы проверены.
+        rejected и failed обязательно содержат error, остальные состояния —
+        без поля error. created_at/updated_at выдаются в UTC с Z.
+      properties:
+        id:
+          type: string
+          format: uuid
+        room_id:
+          type: string
+          minLength: 1
+        start_at:
+          type: string
+        end_at:
+          type: string
+        state:
+          type: string
+          enum: [created, checking, confirmed, rejected, failed, cancelled, completed]
+        created_at:
+          type: string
+          format: date-time
+          pattern: 'Z$'
+        updated_at:
+          type: string
+          format: date-time
+          pattern: 'Z$'
+        error:
+          $ref: '#/components/schemas/Error'
+      oneOf:
+        - properties:
+            state:
+              enum: [created, checking, confirmed, cancelled, completed]
+          not:
+            required: [error]
+        - required: [error]
+          properties:
+            state:
+              enum: [rejected]
+            error:
+              properties:
+                code:
+                  enum: [TIMEZONE_REQUIRED, INVALID_TIME_FORMAT, INVALID_INTERVAL, START_IN_PAST, ROOM_NOT_FOUND, ROOM_UNAVAILABLE]
+        - required: [error]
+          properties:
+            state:
+              enum: [failed]
+            error:
+              properties:
+                code:
+                  enum: [SCHEDULE_TIMEOUT, SCHEDULE_INVALID_RESPONSE, SCHEDULE_UNAVAILABLE, PROCESSING_INTERRUPTED, INTERNAL_ERROR]
+    Error:
+      type: object
+      additionalProperties: false
+      required: [code, message, details]
+      description: |
+        Единая форма HTTP-ошибки и Job.error. code — стабильный машинный код,
+        message — понятное пользователю сообщение без стека и секретов.
+        details содержит хотя бы одну причину и имя связанного поля.
+        Для rejected допустимы TIMEZONE_REQUIRED, INVALID_TIME_FORMAT,
+        INVALID_INTERVAL, START_IN_PAST, ROOM_NOT_FOUND, ROOM_UNAVAILABLE;
+        для failed — SCHEDULE_TIMEOUT, SCHEDULE_INVALID_RESPONSE,
+        SCHEDULE_UNAVAILABLE, PROCESSING_INTERRUPTED, INTERNAL_ERROR.
+      properties:
+        code:
+          type: string
+          enum:
+            - BAD_JSON
+            - UNAUTHORIZED
+            - UNSUPPORTED_MEDIA_TYPE
+            - VALIDATION_ERROR
+            - JOB_NOT_FOUND
+            - IDEMPOTENCY_KEY_REUSED
+            - INVALID_JOB_TRANSITION
+            - CANCELLATION_TOO_LATE
+            - TIMEZONE_REQUIRED
+            - INVALID_TIME_FORMAT
+            - INVALID_INTERVAL
+            - START_IN_PAST
+            - ROOM_NOT_FOUND
+            - ROOM_UNAVAILABLE
+            - SCHEDULE_TIMEOUT
+            - SCHEDULE_INVALID_RESPONSE
+            - SCHEDULE_UNAVAILABLE
+            - PROCESSING_INTERRUPTED
+            - STORAGE_UNAVAILABLE
+            - INTERNAL_ERROR
+        message:
+          type: string
+          minLength: 1
+        details:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/ErrorDetail'
+    ErrorDetail:
+      type: object
+      additionalProperties: false
+      required: [field, issue]
+      properties:
+        field:
+          type: string
+          minLength: 1
+          description: |
+            Имя поля тела, параметра пути или заголовка: start_at, end_at,
+            room_id, participants, equipment.0, state, job_id,
+            Idempotency-Key, Authorization, Content-Type.
+            Вложенные поля — через точку; $ обозначает запрос целиком
+            (например, отказ расписания, хранилища или синтаксис JSON).
+        issue:
+          type: string
+          minLength: 1
+          description: Что нарушено и какое значение/условие ожидается; без секретов.
+  responses:
+    BadJson:
+      description: Невалидный JSON; запрос не создаёт Job.
+      headers:
+        Cache-Control:
+          $ref: '#/components/headers/NoStore'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            code: BAD_JSON
+            message: Не удалось разобрать JSON
+            details:
+              - field: '$'
+                issue: Передайте корректный JSON-объект
+    Unauthorized:
+      description: Токен отсутствует, неизвестен или недействителен; запрос не выполняется.
+      headers:
+        Cache-Control:
+          $ref: '#/components/headers/NoStore'
+        WWW-Authenticate:
+          schema:
+            type: string
+          example: Bearer
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            code: UNAUTHORIZED
+            message: Требуется действительный токен
+            details:
+              - field: Authorization
+                issue: Передайте Authorization с Bearer-токеном
+    UnsupportedMediaType:
+      description: Для операции с JSON-телом требуется Content-Type application/json.
+      headers:
+        Cache-Control:
+          $ref: '#/components/headers/NoStore'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            code: UNSUPPORTED_MEDIA_TYPE
+            message: Неподдерживаемый формат тела запроса
+            details:
+              - field: Content-Type
+                issue: Требуется application/json
+    ValidationError:
+      description: |
+        Некорректная структура тела, лишнее/отсутствующее поле, параметр пути
+        или заголовок. У поиска сюда входят также неверное время и интервал.
+        У POST /jobs неверные значения строк времени дают rejected Job
+        вместо этого HTTP-ответа. Валидация структуры не создаёт новый Job.
+      headers:
+        Cache-Control:
+          $ref: '#/components/headers/NoStore'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            code: VALIDATION_ERROR
+            message: Проверьте поля запроса
+            details:
+              - field: participants
+                issue: Требуется целое число не меньше 1
+    JobNotFound:
+      description: Job не существует или принадлежит другому пользователю; одинаковые код и тело.
+      headers:
+        Cache-Control:
+          $ref: '#/components/headers/NoStore'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            code: JOB_NOT_FOUND
+            message: Заявка не найдена
+            details:
+              - field: job_id
+                issue: Заявка с таким идентификатором недоступна
+    StorageUnavailable:
+      description: |
+        Хранилище недоступно или транзакция не завершена в допустимый срок.
+        Успех записи не утверждается; повторите создание с прежним ключом
+        либо прочитайте известный Job после восстановления сервиса.
+      headers:
+        Cache-Control:
+          $ref: '#/components/headers/NoStore'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            code: STORAGE_UNAVAILABLE
+            message: Хранилище временно недоступно
+            details:
+              - field: '$'
+                issue: Не удалось прочитать или надёжно сохранить состояние
+    InternalError:
+      description: |
+        Непредвиденная ошибка сервиса, детали реализации не раскрываются.
+        Если Job уже был сохранён, выясните результат через его id или
+        повторное создание с прежним ключом и телом.
+      headers:
+        Cache-Control:
+          $ref: '#/components/headers/NoStore'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            code: INTERNAL_ERROR
+            message: Не удалось выполнить запрос
+            details:
+              - field: '$'
+                issue: Повторите чтение или создание с прежним ключом
