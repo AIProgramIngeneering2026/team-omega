@@ -8,7 +8,8 @@ info:
     служит идентификатором брони. Интервалы полуоткрытые [start_at, end_at),
     сравнения времени выполняются в UTC. Соседние интервалы не конфликтуют.
     Все ошибки, включая Job.error, имеют схему Error.
-    Ответы о Job и ошибках не кешируются.
+    Все ответы содержат Cache-Control: no-store, чтобы кеш не возвращал
+    устаревшее состояние, результат поиска или ошибку.
   contact:
     name: Команда omega
     url: https://github.com/AIProgramIngeneering2026/team-omega
@@ -52,6 +53,9 @@ paths:
       responses:
         '200':
           description: Подходящие свободные аудитории, включая пустой список.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
           content:
             application/json:
               schema:
@@ -79,6 +83,9 @@ paths:
           $ref: '#/components/responses/InternalError'
         '502':
           description: Расписание недоступно или ответ некорректен; свободные аудитории не утверждаются.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
           content:
             application/json:
               schema:
@@ -102,6 +109,9 @@ paths:
           $ref: '#/components/responses/StorageUnavailable'
         '504':
           description: Исчерпан общий срок проверки расписания 5 секунд, включая повторы.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
           content:
             application/json:
               schema:
@@ -169,6 +179,8 @@ paths:
         '201':
           description: Заявка создана, исход проверки — confirmed, rejected или failed.
           headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
             Location:
               $ref: '#/components/headers/JobLocation'
           content:
@@ -224,6 +236,8 @@ paths:
         '200':
           description: Повтор с тем же ключом и телом; исходный Job в текущем состоянии.
           headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
             Location:
               $ref: '#/components/headers/JobLocation'
           content:
@@ -236,6 +250,9 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '409':
           description: Idempotency-Key уже связан с другим телом этого пользователя.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
           content:
             application/json:
               schema:
@@ -269,6 +286,9 @@ paths:
       responses:
         '200':
           description: Текущее состояние собственной заявки.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
           content:
             application/json:
               schema:
@@ -303,6 +323,9 @@ paths:
       responses:
         '200':
           description: Бронь отменена, возвращается Job с состоянием cancelled.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
           content:
             application/json:
               schema:
@@ -319,6 +342,9 @@ paths:
           $ref: '#/components/responses/JobNotFound'
         '409':
           description: Состояние или время не допускают отмену; команда не отменяет бронь.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
           content:
             application/json:
               schema:
@@ -377,6 +403,12 @@ components:
         pattern: '^[A-Za-z0-9._:-]+$'
       example: 4b88554f-a049-4f38-8128-85a046006a11
   headers:
+    NoStore:
+      description: Ответ не должен сохраняться кешами.
+      schema:
+        type: string
+        enum: [no-store]
+      example: no-store
     JobLocation:
       description: Относительный URL созданной или повторно полученной заявки /jobs/{id}.
       schema:
@@ -573,6 +605,9 @@ components:
   responses:
     BadJson:
       description: Невалидный JSON; запрос не создаёт Job.
+      headers:
+        Cache-Control:
+          $ref: '#/components/headers/NoStore'
       content:
         application/json:
           schema:
@@ -586,6 +621,8 @@ components:
     Unauthorized:
       description: Токен отсутствует, неизвестен или недействителен; запрос не выполняется.
       headers:
+        Cache-Control:
+          $ref: '#/components/headers/NoStore'
         WWW-Authenticate:
           schema:
             type: string
@@ -602,6 +639,9 @@ components:
                 issue: Передайте Authorization с Bearer-токеном
     UnsupportedMediaType:
       description: Для операции с JSON-телом требуется Content-Type application/json.
+      headers:
+        Cache-Control:
+          $ref: '#/components/headers/NoStore'
       content:
         application/json:
           schema:
@@ -618,6 +658,9 @@ components:
         или заголовок. У поиска сюда входят также неверное время и интервал.
         У POST /jobs неверные значения строк времени дают rejected Job
         вместо этого HTTP-ответа. Валидация структуры не создаёт новый Job.
+      headers:
+        Cache-Control:
+          $ref: '#/components/headers/NoStore'
       content:
         application/json:
           schema:
@@ -630,6 +673,9 @@ components:
                 issue: Требуется целое число не меньше 1
     JobNotFound:
       description: Job не существует или принадлежит другому пользователю; одинаковые код и тело.
+      headers:
+        Cache-Control:
+          $ref: '#/components/headers/NoStore'
       content:
         application/json:
           schema:
@@ -645,6 +691,9 @@ components:
         Хранилище недоступно или транзакция не завершена в допустимый срок.
         Успех записи не утверждается; повторите создание с прежним ключом
         либо прочитайте известный Job после восстановления сервиса.
+      headers:
+        Cache-Control:
+          $ref: '#/components/headers/NoStore'
       content:
         application/json:
           schema:
@@ -660,6 +709,9 @@ components:
         Непредвиденная ошибка сервиса, детали реализации не раскрываются.
         Если Job уже был сохранён, выясните результат через его id или
         повторное создание с прежним ключом и телом.
+      headers:
+        Cache-Control:
+          $ref: '#/components/headers/NoStore'
       content:
         application/json:
           schema:
