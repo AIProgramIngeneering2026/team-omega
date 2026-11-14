@@ -475,8 +475,9 @@ components:
       required: [room_id, start_at, end_at]
       description: |
         Неверные значения строк времени приводят к созданию rejected Job.
-        Отсутствующие/нестроковые/пустые поля и лишние поля, включая state
-        и owner_id, дают 422 без создания Job. Оба времени — исходные строки.
+        Отсутствующие или нестроковые поля, пустой room_id и лишние поля,
+        включая state и owner_id, дают 422 без создания Job. Пустые строки
+        времени сохраняются и приводят к rejected / INVALID_TIME_FORMAT.
       properties:
         room_id:
           type: string
@@ -484,14 +485,12 @@ components:
           description: Идентификатор из результата поиска; отсутствующая аудитория даёт rejected / ROOM_NOT_FOUND.
         start_at:
           type: string
-          minLength: 1
           description: |
             Ожидается полная дата и время ISO 8601 со смещением (Z или ±HH:MM).
             Неразбираемая строка — INVALID_TIME_FORMAT; локальная дата-время
             без смещения — TIMEZONE_REQUIRED; начало в прошлом — START_IN_PAST.
         end_at:
           type: string
-          minLength: 1
           description: |
             Те же правила формата; конец не позже начала в UTC — INVALID_INTERVAL
             с details[].field = end_at.
@@ -513,10 +512,8 @@ components:
           minLength: 1
         start_at:
           type: string
-          minLength: 1
         end_at:
           type: string
-          minLength: 1
         state:
           type: string
           enum: [created, checking, confirmed, rejected, failed, cancelled, completed]
@@ -539,7 +536,19 @@ components:
         - required: [error]
           properties:
             state:
-              enum: [rejected, failed]
+              enum: [rejected]
+            error:
+              properties:
+                code:
+                  enum: [TIMEZONE_REQUIRED, INVALID_TIME_FORMAT, INVALID_INTERVAL, START_IN_PAST, ROOM_NOT_FOUND, ROOM_UNAVAILABLE]
+        - required: [error]
+          properties:
+            state:
+              enum: [failed]
+            error:
+              properties:
+                code:
+                  enum: [SCHEDULE_TIMEOUT, SCHEDULE_INVALID_RESPONSE, SCHEDULE_UNAVAILABLE, PROCESSING_INTERRUPTED, INTERNAL_ERROR]
     Error:
       type: object
       additionalProperties: false
