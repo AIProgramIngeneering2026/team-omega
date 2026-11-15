@@ -10,6 +10,20 @@ info:
     Все ошибки, включая Job.error, имеют схему Error.
     Все ответы содержат Cache-Control: no-store, чтобы кеш не возвращал
     устаревшее состояние, результат поиска или ошибку.
+    Максимальный размер тела любого запроса — 65536 байт (64 КиБ), включая
+    пробелы JSON. Ровно 65536 байт допустимы; превышение даёт 413
+    PAYLOAD_TOO_LARGE с details[].field = $ до разбора JSON и обработки
+    операции, без создания Job, изменения брони и занятия Idempotency-Key.
+    Проверяется фактически прочитанный объём, в том числе без Content-Length;
+    чтение прекращается при превышении лимита. Этот отказ имеет приоритет
+    перед маршрутизацией, аутентификацией и остальными проверками.
+    Для тела в пределах лимита неизвестный путь даёт 404 ROUTE_NOT_FOUND,
+    а метод, не перечисленный для известного пути в paths, — 405
+    METHOD_NOT_ALLOWED с Allow (POST или GET согласно paths).
+    Маршрутизация предшествует аутентификации и проверке параметров пути;
+    обе ошибки имеют формат Error с полем $ и не выполняют операцию,
+    не создают Job, не меняют бронь и не занимают Idempotency-Key.
+    JOB_NOT_FOUND относится только к известным операциям с Job.
   contact:
     name: Команда omega
     url: https://github.com/AIProgramIngeneering2026/team-omega
@@ -18,6 +32,20 @@ servers:
     description: Локальная разработка; вне локальной среды используется HTTPS.
 security:
   - bearerAuth: []
+x-request-body-limit:
+  maxBytes: 65536
+  status: 413
+  response:
+    $ref: '#/components/responses/PayloadTooLarge'
+x-routing-errors:
+  unknownPath:
+    status: 404
+    response:
+      $ref: '#/components/responses/RouteNotFound'
+  unsupportedMethod:
+    status: 405
+    response:
+      $ref: '#/components/responses/MethodNotAllowed'
 tags:
   - name: Rooms
     description: Поиск свободных аудиторий без создания Job.
@@ -75,6 +103,8 @@ paths:
           $ref: '#/components/responses/BadJson'
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
         '415':
           $ref: '#/components/responses/UnsupportedMediaType'
         '422':
@@ -248,6 +278,8 @@ paths:
           $ref: '#/components/responses/BadJson'
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
         '409':
           description: Idempotency-Key уже связан с другим телом этого пользователя.
           headers:
@@ -295,6 +327,8 @@ paths:
                 $ref: '#/components/schemas/Job'
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
         '404':
           $ref: '#/components/responses/JobNotFound'
         '422':
@@ -338,6 +372,8 @@ paths:
                         enum: [cancelled]
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
         '404':
           $ref: '#/components/responses/JobNotFound'
         '409':
@@ -422,11 +458,13 @@ components:
       properties:
         start_at:
           type: string
+          maxLength: 64
           format: date-time
           pattern: '(Z|[+-][0-9]{2}:[0-9]{2})$'
           description: Полная дата и время со смещением, не раньше снимка now в начале поиска.
         end_at:
           type: string
+          maxLength: 64
           format: date-time
           pattern: '(Z|[+-][0-9]{2}:[0-9]{2})$'
           description: Полная дата и время со смещением, строго позже start_at после приведения к UTC.
@@ -435,11 +473,13 @@ components:
           minimum: 1
         equipment:
           type: array
+          maxItems: 100
           uniqueItems: true
           description: Все необходимые коды оборудования; пустой список означает отсутствие требований.
           items:
             type: string
             minLength: 1
+            maxLength: 128
     Room:
       type: object
       additionalProperties: false
@@ -475,22 +515,26 @@ components:
       required: [room_id, start_at, end_at]
       description: |
         Неверные значения строк времени приводят к созданию rejected Job.
-        Отсутствующие или нестроковые поля, пустой room_id и лишние поля,
-        включая state и owner_id, дают 422 без создания Job. Пустые строки
+        Отсутствующие или нестроковые поля, пустой room_id, превышение
+        maxLength и лишние поля, включая state и owner_id, дают 422
+        без создания Job и занятия ключа. Пустые строки
         времени сохраняются и приводят к rejected / INVALID_TIME_FORMAT.
       properties:
         room_id:
           type: string
           minLength: 1
+          maxLength: 128
           description: Идентификатор из результата поиска; отсутствующая аудитория даёт rejected / ROOM_NOT_FOUND.
         start_at:
           type: string
+          maxLength: 64
           description: |
             Ожидается полная дата и время ISO 8601 со смещением (Z или ±HH:MM).
             Неразбираемая строка — INVALID_TIME_FORMAT; локальная дата-время
             без смещения — TIMEZONE_REQUIRED; начало в прошлом — START_IN_PAST.
         end_at:
           type: string
+          maxLength: 64
           description: |
             Те же правила формата; конец не позже начала в UTC — INVALID_INTERVAL
             с details[].field = end_at.
@@ -566,6 +610,9 @@ components:
           type: string
           enum:
             - BAD_JSON
+            - ROUTE_NOT_FOUND
+            - METHOD_NOT_ALLOWED
+            - PAYLOAD_TOO_LARGE
             - UNAUTHORIZED
             - UNSUPPORTED_MEDIA_TYPE
             - VALIDATION_ERROR
@@ -612,6 +659,59 @@ components:
           minLength: 1
           description: Что нарушено и какое значение/условие ожидается; без секретов.
   responses:
+    RouteNotFound:
+      description: Неизвестный путь; операция не выполняется, Job не создаётся и ключ не занимается.
+      headers:
+        Cache-Control:
+          $ref: '#/components/headers/NoStore'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            code: ROUTE_NOT_FOUND
+            message: Маршрут не найден
+            details:
+              - field: '$'
+                issue: Используйте путь из раздела paths контракта
+    MethodNotAllowed:
+      description: Метод не поддерживается для известного пути; нет изменений Job, брони или ключа.
+      headers:
+        Cache-Control:
+          $ref: '#/components/headers/NoStore'
+        Allow:
+          description: Все методы из paths для этого пути; POST для поиска, создания и отмены, GET для чтения Job.
+          schema:
+            type: string
+            enum: [GET, POST]
+          example: GET
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            code: METHOD_NOT_ALLOWED
+            message: Метод не поддерживается
+            details:
+              - field: '$'
+                issue: Используйте метод из заголовка Allow
+    PayloadTooLarge:
+      description: |
+        Тело превышает 65536 байт; отказ до разбора JSON, без создания Job,
+        изменения брони и занятия ключа. Ограничение применяется и к повторам.
+      headers:
+        Cache-Control:
+          $ref: '#/components/headers/NoStore'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            code: PAYLOAD_TOO_LARGE
+            message: Превышен допустимый размер тела запроса
+            details:
+              - field: '$'
+                issue: Максимальный размер тела запроса — 65536 байт
     BadJson:
       description: Невалидный JSON; запрос не создаёт Job.
       headers:
@@ -663,10 +763,13 @@ components:
                 issue: Требуется application/json
     ValidationError:
       description: |
-        Некорректная структура тела, лишнее/отсутствующее поле, параметр пути
-        или заголовок. У поиска сюда входят также неверное время и интервал.
-        У POST /jobs неверные значения строк времени дают rejected Job
-        вместо этого HTTP-ответа. Валидация структуры не создаёт новый Job.
+        Некорректная структура тела, лишнее/отсутствующее поле, превышение
+        maxLength или maxItems, параметр пути или заголовок. details указывает
+        нарушенное поле (например, room_id, start_at, equipment, equipment.0).
+        У поиска сюда входят также неверное время и интервал.
+        У POST /jobs неверные значения строк времени в пределах maxLength
+        дают rejected Job вместо этого HTTP-ответа. Валидация структуры
+        не создаёт новый Job и не занимает ключ идемпотентности.
       headers:
         Cache-Control:
           $ref: '#/components/headers/NoStore'
