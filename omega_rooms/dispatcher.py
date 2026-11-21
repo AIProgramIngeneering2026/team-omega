@@ -72,7 +72,7 @@ class Dispatcher:
 
     def book(self, operation: str, owner: str, key: str, request: BookingRequest) -> Job:
         tool = self._registry.get(operation)
-        job, claimed = self._repository.claim(owner, key, request, self._clock())
+        job, claimed = self._repository.claim(owner, key, request, self._clock)
         if not claimed:
             return job
         try:
@@ -86,7 +86,7 @@ class Dispatcher:
             except Exception:
                 outcome = Failure(self._internal_error())
 
-            saved = self._repository.get(job.id)
+            saved = self._repository.get_for_owner(owner, job.id, self._clock)
             if saved.state != JobState.CHECKING:
                 # Tool мог сохранить исход, а владелец — успеть отменить бронь.
                 return saved
@@ -99,10 +99,10 @@ class Dispatcher:
             self._repository.release(job.id)
 
     def get(self, owner: str, job_id: UUID) -> Job:
-        return self._repository.get_for_owner(owner, job_id, self._clock())
+        return self._repository.get_for_owner(owner, job_id, self._clock)
 
     def cancel(self, owner: str, job_id: UUID) -> Job:
-        return self._repository.cancel(owner, job_id, self._clock())
+        return self._repository.cancel(owner, job_id, self._clock)
 
     def recover(self) -> tuple[Job, ...]:
         return self._repository.recover()

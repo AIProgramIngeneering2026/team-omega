@@ -28,7 +28,7 @@ class JobTest(TestCase):
         self.dispatcher = Dispatcher(self.repo, Registry([BookingDouble(self.repo)]), lambda: NOW)
 
     def new_job(self, key="key"):
-        job, _ = self.repo.claim("alice", key, REQUEST, NOW)
+        job, _ = self.repo.claim("alice", key, REQUEST, lambda: NOW)
         self.repo.release(job.id)
         return job
 
@@ -136,12 +136,44 @@ class JobTest(TestCase):
         class BookingThenCancellation(BookingDouble):
             def execute(self, work):
                 result = super().execute(work)
-                repo.cancel("alice", work.job_id, NOW)
+                repo.cancel("alice", work.job_id, lambda: NOW)
                 return result
 
         dispatcher = Dispatcher(repo, Registry([BookingThenCancellation(repo)]), lambda: NOW)
         job = dispatcher.book("BookingTool", "alice", "key", REQUEST)
         self.assertEqual(job.state, JobState.CANCELLED)
+
+    def test_booking_reads_completed_state_if_interval_ends_before_tool_returns(self):
+        current_time = NOW
+
+        class BookingAtEnd(BookingDouble):
+            def execute(self, work):
+                nonlocal current_time
+                confirmed = super().execute(work)
+                current_time = SLOT.end
+                return confirmed
+
+        dispatcher = Dispatcher(
+            self.repo, Registry([BookingAtEnd(self.repo)]), lambda: current_time,
+        )
+        job = dispatcher.book("BookingTool", "alice", "key", REQUEST)
+        self.assertEqual(job.state, JobState.COMPLETED)
+
+    def test_cancel_checks_time_after_waiting_for_repository(self):
+        current_time = NOW
+
+        class QueuedCancellation(InMemoryRepository):
+            def cancel(self, owner, job_id, clock):
+                nonlocal current_time
+                current_time = SLOT.start
+                return super().cancel(owner, job_id, clock)
+
+        repo = QueuedCancellation()
+        dispatcher = Dispatcher(repo, Registry([BookingDouble(repo)]), lambda: current_time)
+        job = dispatcher.book("BookingTool", "alice", "key", REQUEST)
+        with self.assertRaises(DomainError) as caught:
+            dispatcher.cancel("alice", job.id)
+        self.assertEqual(caught.exception.code, "CANCELLATION_TOO_LATE")
 
     def test_different_body_cannot_reuse_key(self):
         self.book()

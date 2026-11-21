@@ -1,10 +1,14 @@
+import logging
 from dataclasses import dataclass
 from datetime import datetime
 from threading import Lock
-from typing import Iterable, Protocol
+from typing import Callable, Iterable, Protocol
 from uuid import UUID, uuid4
 
 from .job import BookingRequest, DomainError, Error, Interval, Job, JobState, error
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -17,17 +21,16 @@ class Room:
 
 class Repository(Protocol):
     def claim(
-        self, owner: str, key: str, request: BookingRequest, now: datetime,
+        self, owner: str, key: str, request: BookingRequest, clock: Callable[[], datetime],
     ) -> tuple[Job, bool]: ...
 
     def start(self, job_id: UUID) -> Job: ...
-    def get(self, job_id: UUID) -> Job: ...
     def reject(self, job_id: UUID, reason: Error) -> Job: ...
     def fail(self, job_id: UUID, reason: Error) -> Job: ...
     def release(self, job_id: UUID) -> None: ...
     def recover(self) -> tuple[Job, ...]: ...
-    def get_for_owner(self, owner: str, job_id: UUID, now: datetime) -> Job: ...
-    def cancel(self, owner: str, job_id: UUID, now: datetime) -> Job: ...
+    def get_for_owner(self, owner: str, job_id: UUID, clock: Callable[[], datetime]) -> Job: ...
+    def cancel(self, owner: str, job_id: UUID, clock: Callable[[], datetime]) -> Job: ...
     def rooms(self) -> tuple[Room, ...]: ...
     def busy_rooms(self, room_ids: set[str], interval: Interval) -> set[str]: ...
     def confirm(self, job_id: UUID, interval: Interval) -> Job: ...
@@ -58,7 +61,7 @@ class InMemoryRepository:
         return job
 
     def claim(
-        self, owner: str, key: str, request: BookingRequest, now: datetime,
+        self, owner: str, key: str, request: BookingRequest, clock: Callable[[], datetime],
     ) -> tuple[Job, bool]:
         with self._lock:
             job_id = self._keys.get((owner, key))
@@ -69,7 +72,7 @@ class InMemoryRepository:
                         "IDEMPOTENCY_KEY_REUSED", "Idempotency-Key",
                         "Этот ключ уже использован с другими параметрами заявки",
                     ))
-                return self._save(job.complete_if_due(now)), False
+                return self._save(job.complete_if_due(clock())), False
 
             job = self._save(Job(uuid4(), owner, key, request))
             self._keys[owner, key] = job.id
@@ -84,14 +87,19 @@ class InMemoryRepository:
         with self._lock:
             return self._get(job_id)
 
-    def get_for_owner(self, owner: str, job_id: UUID, now: datetime) -> Job:
+    def get_for_owner(self, owner: str, job_id: UUID, clock: Callable[[], datetime]) -> Job:
         with self._lock:
-            return self._save(self._get_for_owner(owner, job_id).complete_if_due(now))
+            job = self._get_for_owner(owner, job_id)
+            return self._save(job.complete_if_due(clock()))
 
     def confirm(self, job_id: UUID, interval: Interval) -> Job:
         with self._lock:
             job = self._get(job_id)
-            confirmed = job.confirm(interval)
+            try:
+                confirmed = job.confirm(interval)
+            except DomainError:
+                logger.info("Отклонено подтверждение Job %s из состояния %s", job.id, job.state.value)
+                raise
             if self._busy_rooms({job.request.room_id}, interval):
                 return self._save(job.reject(error(
                     "ROOM_UNAVAILABLE", "room_id", "Интервал пересекается с подтверждённой бронью",
@@ -106,9 +114,11 @@ class InMemoryRepository:
         with self._lock:
             return self._save(self._get(job_id).fail(reason))
 
-    def cancel(self, owner: str, job_id: UUID, now: datetime) -> Job:
+    def cancel(self, owner: str, job_id: UUID, clock: Callable[[], datetime]) -> Job:
         with self._lock:
-            job = self._save(self._get_for_owner(owner, job_id).complete_if_due(now))
+            job = self._get_for_owner(owner, job_id)
+            now = clock()
+            job = self._save(job.complete_if_due(now))
             return self._save(job.cancel(now))
 
     def release(self, job_id: UUID) -> None:
