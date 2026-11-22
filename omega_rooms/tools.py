@@ -82,11 +82,19 @@ def _validate_interval(start_at: str, end_at: str, now: datetime) -> Interval:
     return Interval(start, end)
 
 
-def _scheduled_rooms(schedule: Schedule, room_ids: set[str], interval: Interval) -> set[str]:
-    started = monotonic()
-    busy = schedule.busy_rooms(room_ids, interval, timeout=_SCHEDULE_TIMEOUT)
+def _check_schedule_deadline(started: float) -> None:
     if monotonic() - started >= _SCHEDULE_TIMEOUT:
         raise DomainError(error("SCHEDULE_TIMEOUT", "$", "Вышло время проверки расписания"))
+
+
+def _scheduled_rooms(schedule: Schedule, room_ids: set[str], interval: Interval) -> set[str]:
+    started = monotonic()
+    try:
+        busy = schedule.busy_rooms(room_ids, interval, timeout=_SCHEDULE_TIMEOUT)
+    except Exception:
+        _check_schedule_deadline(started)
+        raise
+    _check_schedule_deadline(started)
     if not isinstance(busy, set) or not busy <= room_ids:
         raise DomainError(error("SCHEDULE_INVALID_RESPONSE", "$", "Некорректный ответ расписания"))
     return busy

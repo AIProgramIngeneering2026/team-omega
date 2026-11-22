@@ -2,6 +2,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from threading import Barrier
 from unittest import TestCase
+from unittest.mock import patch
 
 from omega_rooms.dispatcher import Dispatcher, Registry
 from omega_rooms.job import BookingRequest, DomainError, Interval, JobState, error
@@ -13,7 +14,7 @@ NOW = datetime(2026, 11, 21, 8, tzinfo=timezone.utc)
 START = "2026-11-21T15:00:00+05:00"
 END = "2026-11-21T11:00:00Z"
 ROOM_A = Room("A-301", "А-301", 30, ("projector",))
-ROOM_B = Room("B-201", "Б-201", 40, ("projector",))
+ROOM_B = Room("B-201", "Б-201", 40, ("projector", "whiteboard"))
 ROOM_C = Room("C-101", "В-101", 12)
 ROOM_D = Room("D-101", "Г-101", 30, ("projector",))
 
@@ -45,6 +46,9 @@ class ToolsTest(TestCase):
     def test_search_filters_equipment_and_capacity_and_sorts_rooms(self):
         self.assertEqual(self.search().rooms, (ROOM_A, ROOM_B, ROOM_D))
         self.assertEqual(self.search(equipment=("unknown",)).rooms, ())
+
+    def test_search_requires_every_requested_equipment_code(self):
+        self.assertEqual(self.search(equipment=("projector", "whiteboard")).rooms, (ROOM_B,))
 
     def test_search_excludes_both_schedule_and_local_bookings(self):
         self.setup_tools(InMemorySchedule({
@@ -109,6 +113,26 @@ class ToolsTest(TestCase):
         self.assertEqual(job.state, JobState.FAILED)
         self.assertEqual(job.error.code, "SCHEDULE_TIMEOUT")
         self.assertEqual(job.error.details[0].field, "$")
+
+    def test_booking_does_not_accept_success_on_the_schedule_deadline(self):
+        with patch("omega_rooms.tools.monotonic", side_effect=(10.0, 15.0)):
+            job = self.book()
+        self.assertEqual(job.state, JobState.FAILED)
+        self.assertEqual(job.error.code, "SCHEDULE_TIMEOUT")
+        self.assertEqual(job.error.details[0].field, "$")
+
+    def test_booking_classifies_adapter_errors_by_the_schedule_deadline(self):
+        class ScheduleConnectionFailure:
+            def busy_rooms(self, room_ids, interval, *, timeout):
+                raise DomainError(error("SCHEDULE_UNAVAILABLE", "$", "Расписание недоступно"))
+
+        self.setup_tools(ScheduleConnectionFailure())
+        for end_time, expected in ((14.9, "SCHEDULE_UNAVAILABLE"), (15.1, "SCHEDULE_TIMEOUT")):
+            with self.subTest(end_time=end_time):
+                with patch("omega_rooms.tools.monotonic", side_effect=(10.0, end_time)):
+                    job = self.book(key=str(end_time))
+                self.assertEqual(job.state, JobState.FAILED)
+                self.assertEqual(job.error.code, expected)
 
     def test_live_recovery_after_storage_refuses_confirmation(self):
         class TemporarilyUnavailableRepository(InMemoryRepository):
