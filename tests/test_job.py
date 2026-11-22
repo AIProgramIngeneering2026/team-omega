@@ -2,7 +2,7 @@ from datetime import datetime, timezone
 from threading import Event, Thread
 from unittest import TestCase
 
-from omega_rooms.dispatcher import Dispatcher, Registry
+from omega_rooms.dispatcher import Dispatcher, Failure, Registry, Rejection
 from omega_rooms.job import BookingRequest, DomainError, Interval, JobState, error
 from omega_rooms.repository import InMemoryRepository
 
@@ -129,6 +129,44 @@ class JobTest(TestCase):
         self.assertEqual(job.state, JobState.FAILED)
         self.assertEqual(job.error.code, "INTERNAL_ERROR")
         self.assertNotIn("private implementation detail", job.error.message)
+
+    def test_tool_rejection_is_saved_and_replayed_without_calling_the_tool(self):
+        reason = error("INVALID_INTERVAL", "end_at", "Конец должен быть позже начала")
+        self.assert_replayed_tool_result(Rejection(reason), JobState.REJECTED, reason)
+
+    def test_tool_failure_is_saved_and_replayed_without_calling_the_tool(self):
+        reason = error("SCHEDULE_TIMEOUT", "$", "Вышло время проверки")
+        self.assert_replayed_tool_result(Failure(reason), JobState.FAILED, reason)
+
+    def assert_replayed_tool_result(self, outcome, state, reason):
+        calls = []
+
+        class ToolWithResult:
+            name = "BookingTool"
+
+            def execute(self, work):
+                calls.append(work.job_id)
+                return outcome
+
+        self.dispatcher = Dispatcher(self.repo, Registry([ToolWithResult()]), lambda: NOW)
+        job = self.book()
+        self.assertEqual(job.state, state)
+        self.assertEqual(job.error, reason)
+        self.assertEqual(self.book(), job)
+        self.assertEqual(calls, [job.id])
+
+    def test_tool_cannot_confirm_job_by_returning_an_unsaved_snapshot(self):
+        class UnpersistedConfirmation(BookingDouble):
+            def execute(self, work):
+                return self.repository.get(work.job_id).confirm(SLOT)
+
+        self.dispatcher = Dispatcher(
+            self.repo, Registry([UnpersistedConfirmation(self.repo)]), lambda: NOW,
+        )
+        job = self.book()
+        self.assertEqual(job.state, JobState.FAILED)
+        self.assertEqual(job.error.code, "INTERNAL_ERROR")
+        self.assertEqual(self.repo.busy_rooms({"A-301"}, SLOT), set())
 
     def test_cancel_between_tool_commit_and_return_preserves_current_state(self):
         repo = self.repo
