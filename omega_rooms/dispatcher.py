@@ -71,10 +71,16 @@ class Dispatcher:
             raise DomainError(self._internal_error()) from None
 
     def book(self, operation: str, owner: str, key: str, request: BookingRequest) -> Job:
+        return self.book_with_status(operation, owner, key, request)[0]
+
+    def book_with_status(
+        self, operation: str, owner: str, key: str, request: BookingRequest,
+    ) -> tuple[Job, bool]:
+        """Create or replay a booking and report whether this request claimed it."""
         tool = self._registry.get(operation)
         job, claimed = self._repository.claim(owner, key, request, self._clock)
         if not claimed:
-            return job
+            return job, False
         try:
             self._repository.start(job.id)
             try:
@@ -89,12 +95,12 @@ class Dispatcher:
             saved = self._repository.get_for_owner(owner, job.id, self._clock)
             if saved.state != JobState.CHECKING:
                 # Tool мог сохранить исход, а владелец — успеть отменить бронь.
-                return saved
+                return saved, True
             if isinstance(outcome, Rejection):
-                return self._repository.reject(job.id, outcome.reason)
+                return self._repository.reject(job.id, outcome.reason), True
             if isinstance(outcome, Failure):
-                return self._repository.fail(job.id, outcome.reason)
-            return self._repository.fail(job.id, self._internal_error())
+                return self._repository.fail(job.id, outcome.reason), True
+            return self._repository.fail(job.id, self._internal_error()), True
         finally:
             self._repository.release(job.id)
 

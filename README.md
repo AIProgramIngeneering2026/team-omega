@@ -26,6 +26,22 @@ Omega Rooms — сервис поиска и бронирования униве
 python3 -B -m unittest discover -s tests -v
 ```
 
+## HTTP API
+
+Установите зависимости API командой `pip install -r requirements.txt`. Соберите
+`Dispatcher` с нужным `Repository` и зарегистрированными Tool, затем передайте
+его и таблицу заранее выданных Bearer-токенов в `create_app`:
+
+```python
+from omega_rooms.api import create_app
+
+app = create_app(dispatcher, {"token-value": "user-id"})
+```
+
+Для локального сервера передайте `app` в Uvicorn, например:
+`uvicorn module_name:app --host 127.0.0.1 --port 8000`. Схемы и ответы API
+описаны в [OpenAPI-контракте](docs/api/openapi.yaml).
+
 Тесты используют стандартную библиотеку Python. Они проверяют жизненный цикл заявки, сценарии З1–З6, ошибки выбора операции и параметров, поиск, а также конфликт одновременных бронирований.
 
 Для проверки восстановления незавершённые Job передаются в новый экземпляр хранилища в памяти. Перед обслуживанием новых запросов `Dispatcher.recover()` завершает такие заявки с кодом `PROCESSING_INTERRUPTED`.
