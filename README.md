@@ -16,7 +16,7 @@ Omega Rooms — сервис поиска и бронирования униве
 
 ## Статус проекта
 
-В практике 3 реализовано доменное ядро на Python 3.10+. Оно проверяет переходы Job, выбирает операции через Registry и выполняет поиск и бронирование аудиторий. Для хранилища и расписания есть реализации в памяти. HTTP API и постоянное хранилище предусмотрены в следующих практиках.
+Проект на Python 3.10+ включает доменное ядро, HTTP API и SQLite-хранилище. Ядро проверяет переходы Job, выбирает операции через Registry и выполняет поиск и бронирование аудиторий. Для модульных тестов есть реализации хранилища и расписания в памяти.
 
 ## Тесты доменного ядра
 
@@ -44,6 +44,39 @@ app = create_app(dispatcher, {"token-value": "user-id"})
 
 Тесты используют стандартную библиотеку Python. Они проверяют жизненный цикл заявки, сценарии З1–З6, ошибки выбора операции и параметров, поиск, а также конфликт одновременных бронирований.
 
-Для проверки восстановления незавершённые Job передаются в новый экземпляр хранилища в памяти. Перед обслуживанием новых запросов `Dispatcher.recover()` завершает такие заявки с кодом `PROCESSING_INTERRUPTED`.
+## Хранилище SQLite
 
-После восстановления доступности хранилища вызывающая сторона также запускает `Dispatcher.recover()`. Вызов пропускает заявки, которые ещё проверяются активным обработчиком.
+Из корня репозитория перед запуском сервиса примените миграции:
+
+```sh
+python -m omega_rooms.migrate omega_rooms.sqlite3
+```
+
+Команду можно повторять: применённые версии записываются в `schema_migrations`.
+При перезапуске используйте тот же файл базы: он хранит каталог аудиторий,
+Job, их результаты и ключи идемпотентности.
+
+Пример локальной сборки приложения после миграций:
+
+```python
+from omega_rooms.api import create_app
+from omega_rooms.dispatcher import Dispatcher, Registry
+from omega_rooms.repository import Room
+from omega_rooms.sqlite_repository import SQLiteRepository
+from omega_rooms.tools import BookingTool, InMemorySchedule, SearchRoomsTool
+
+repository = SQLiteRepository("omega_rooms.sqlite3")
+repository.upsert_rooms([Room("room-101", "Аудитория 101", 30, ("projector",))])
+
+schedule = InMemorySchedule()
+registry = Registry([SearchRoomsTool(repository, schedule), BookingTool(repository, schedule)])
+dispatcher = Dispatcher(repository, registry)
+dispatcher.recover()
+app = create_app(dispatcher, {"local-token": "local-user"})
+```
+
+Запускайте сервис с одним процессом Uvicorn и одним общим экземпляром
+`SQLiteRepository`: список активных обработчиков Job хранится в процессе.
+Перед приёмом запросов `Dispatcher.recover()` переводит прерванные Job
+в `failed` с причиной `PROCESSING_INTERRUPTED`. После восстановления
+доступности базы можно вызвать его повторно: активные заявки он пропускает.
